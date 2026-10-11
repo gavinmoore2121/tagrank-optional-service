@@ -26,6 +26,7 @@ if h_api_version is None:
     pass
 elif len(h_api_version.split(".")) < 3:
     # Version is in a weird format. Ignore.
+
     pass
 else:
     try:
@@ -69,6 +70,22 @@ except ImportError:
             yield batch
 
 
+def tags_from_file_single_service(file: FileMetaData, service_id: str) -> list[str]:
+    # dict of tag repos that may have some tag info.
+    tag_repos: dict[str, dict[str, Any]] = file["tags"]
+    tags: set[str] = set()
+    repo = tag_repos[str(service_id)]
+    if repo["display_tags"] is not None:
+        if str(hydrus_api.TagStatus.CURRENT.value) in repo["display_tags"]:
+            tags.update(repo["display_tags"][str(hydrus_api.TagStatus.CURRENT)])
+
+        if str(hydrus_api.TagStatus.PENDING.value) in repo["display_tags"]:
+            tags.update(repo["display_tags"][str(hydrus_api.TagStatus.PENDING)])
+
+    # we need to go to list here since we need the ordering of this in keeping track of scores.
+    return list(tags)
+
+
 def tags_from_file(file: FileMetaData) -> list[str]:
     # dict of tag repos that may have some tag info.
     tag_repos: dict[str, dict[str, Any]] = file["tags"]
@@ -86,12 +103,26 @@ def tags_from_file(file: FileMetaData) -> list[str]:
 
 
 class RatingSystem:
-    def __init__(self, client: hydrus_api.Client, file_ids: list[int]):
+    def __init__(self, client: hydrus_api.Client, file_ids: list[int], service_id: str):
         self.client = client
         self.file_ids = file_ids
         self.used_file_pairs: set[tuple[int, int]] = set()
 
         self.current_ratings: dict[str, Rating] = {}
+
+        # parse service ID for my_tags
+        services_response = client.get_services()
+        services_map = services_response["services"]
+
+        found_service_id = None
+        for service_id, service_data in services_map.items():
+            if service_data["type"] == hydrus_api.ServiceType.TAG_DOMAIN:
+                if found_service_id is None:
+                    found_service_id = service_id
+                if service_data["name"] == "my tags":
+                    found_service_id = service_id
+
+        self.service_id = found_service_id
 
         if Path("./ratings.json").exists():
             with open(Path("./ratings.json")) as f:
@@ -176,8 +207,10 @@ class RatingSystem:
         return self.client.get_file_path(file_id)["path"]
 
     def process_result(self, *, winner: FileMetaData, loser: FileMetaData):
-        winner_tags = tags_from_file(winner)
-        loser_tags = tags_from_file(loser)
+        #winner_tags = tags_from_file(winner)
+        #loser_tags = tags_from_file(loser)
+        winner_tags = tags_from_file_single_service(winner, self.service_id)
+        loser_tags = tags_from_file_single_service(loser, self.service_id)
 
         winner_ratings = tuple([self.rating_for_tag(tag) for tag in winner_tags])
         loser_ratings = tuple([self.rating_for_tag(tag) for tag in loser_tags])
@@ -538,7 +571,7 @@ system:limit = 500""".strip():
         print_no_relevant_files_then_exit(query)
 
     app = QtWidgets.QApplication(sys.argv)
-    rating_system = RatingSystem(client, relevant_files_ids["file_ids"])
+    rating_system = RatingSystem(client, relevant_files_ids["file_ids"], "my tags")
     window: QtWidgets.QWidget = Window(rating_system)
 
     window.show()
@@ -552,13 +585,23 @@ system:limit = 500""".strip():
                                                  key=lambda x: trueskill_number_from_rating(x[1]),
                                                  reverse=True)[:max(100, AMOUNT_OF_TAGS_IN_CHARTS)]
 
+    many_worst_tags: list[Tuple[str, Rating]] = sorted(rating_system.current_ratings.items(),
+                                                 key=lambda x: trueskill_number_from_rating(x[1]),
+                                                 reverse=False)[:max(100, AMOUNT_OF_TAGS_IN_CHARTS)]
+
     largest_mu_width = len(str(math.floor(trueskill_number_from_rating(many_tags[0][1]))))
     print("The window that shows the scores can be hard to read. So here the data in text for 100 tags:")
     for (tag, rating) in many_tags:
                                                                 # +3 for the three decimals
         print(f"{trueskill_number_from_rating(rating):.3f}".rjust(largest_mu_width+3) + f": {tag}")
 
+    print("And here's the data in text for the 100 worst tags:")
+    for (tag, rating) in many_worst_tags:
+        # +3 for the three decimals
+        print(f"{trueskill_number_from_rating(rating):.3f}".rjust(largest_mu_width + 3) + f": {tag}")
+
     best_tags: list[Tuple[str, Rating]] = many_tags[:AMOUNT_OF_TAGS_IN_CHARTS]
+    worst_tags: list[Tuple[str, Rating]] = many_worst_tags[:AMOUNT_OF_TAGS_IN_CHARTS]
 
     for (tag, rating) in best_tags:
         (mu, sigma) = rating
@@ -570,7 +613,23 @@ system:limit = 500""".strip():
             label=f"{tag} (score:{trueskill_number_from_rating(rating):.2f})"
         )
 
+
+
+
     plt.legend()  # show a legend
+    plt.show()
+
+    for (tag, rating) in worst_tags:
+        (mu, sigma) = rating
+        x2_space = np.linspace(mu - 3 * sigma, mu + 3 * sigma, 100)
+        y2_space = stats.norm.pdf(x2_space, mu, sigma)
+        plt.plot(
+            x2_space,
+            y2_space,
+            label=f"{tag} (score:{trueskill_number_from_rating(rating):.2f})"
+        )
+
+    plt.legend()
     plt.show()
 
     # TODO: Choose files to play against each other. Maybe use some halfway point between high and low win prob?
@@ -668,7 +727,7 @@ def run_for_create_image_ranking(client: hydrus_api.Client) -> None:
     delete_existing_sort_tags_if_needed(client)
 
     #  1. Find all images that have at least one of the scored tags.
-    rating_system = RatingSystem(client, [])
+    rating_system = RatingSystem(client, [], "my_tags")
     tags = list(rating_system.current_ratings.keys())
 
     # The type does not include the "or search" system. Any nested list of tags is seen as OR.
